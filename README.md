@@ -24,11 +24,25 @@ para esconder.
 
 ## O que ele confere
 
-| Quando | O que olha | Quando avisa |
-|---|---|---|
-| De 2 em 2 horas | O app responde? (3 tentativas, conferindo o conteúdo) | Não respondeu nenhuma vez |
-| 1x por dia, de manhã | Validade do certificado direto na VPS | Falta menos de 21 dias |
-| 1x por dia, de manhã | O caminho de renovação do certificado está aberto? | Respondeu algo fora do esperado |
+| Arquivo | Quando | O que olha | Quando avisa |
+|---|---|---|---|
+| `monitor.yml` | De 10 em 10 min | O app responde? (3 tentativas, conferindo o conteúdo) | Não respondeu nenhuma vez |
+| `certificado.yml` | 1x por dia | Validade do certificado direto na VPS | Falta menos de 21 dias |
+| `certificado.yml` | 1x por dia | O caminho de renovação do certificado está aberto? | Respondeu algo fora do esperado |
+
+## O freio de e-mail
+
+Com checagem de 10 em 10 minutos, um app fora do ar por um dia mandaria **144
+e-mails**. Além de inútil, volume assim queima a reputação do domínio no Resend e
+derruba a entrega dos e-mails que vão pras clientes.
+
+Então: **primeiro aviso na hora, e depois no máximo um por hora** enquanto
+continuar fora do ar. O vigia descobre há quanto tempo está caído perguntando ao
+próprio GitHub quantas execuções seguidas já falharam — não guarda estado em
+lugar nenhum.
+
+Por isso a execução fica **vermelha** sempre que o app está fora, mesmo quando o
+e-mail foi segurado: é essa cor que alimenta a contagem da próxima vez.
 
 ## Segredos necessários
 

@@ -1,0 +1,128 @@
+name: Conferência do certificado
+
+# POR QUE ISTO É UM ARQUIVO SEPARADO (desde 21/08/2026)
+# Isto morava dentro do monitor.yml e pegava carona numa execução que já ia
+# acontecer, porque cada execução custava 1 minuto da cota. Duas coisas mudaram:
+# o repositório virou público (execução não custa nada) e o vigia passou de 2 em
+# 2 horas para 10 em 10 minutos. De carona, esta conferência passaria a rodar 144
+# vezes por dia e, num dia de problema, mandaria 144 e-mails.
+# Aqui ela tem o agendamento que sempre quis: uma vez por dia e pronto.
+#
+# POR QUE OLHAR A VPS DIRETO, E NÃO O ENDEREÇO DO SITE. Desde 10/08/2026 a
+# Cloudflare atende na frente. Quem pergunta o certificado de
+# `sara.energeticseed.com` recebe o DELA, que ela renova sozinha e não é
+# problema nosso. O nosso é o Let's Encrypt que vive na VPS, e ele só aparece
+# perguntando direto ao endereço da máquina. Vigiar o endereço público daria
+# "tudo certo" para sempre, inclusive no dia em que o nosso vencesse.
+#
+# E POR QUE O NOSSO AINDA IMPORTA. Com a Cloudflare em Full (strict), ela confere
+# o nosso certificado antes de falar com a VPS. Se ele vencer, ela recusa e o
+# site sai do ar inteiro, mesmo com o servidor perfeito.
+#
+# O Traefik renova sozinho faltando 30 dias. Abaixo de 21 significa que a
+# renovação já falhou por mais de uma semana em silêncio, que é exatamente o
+# tipo de defeito que este vigia existe pra pegar.
+
+on:
+  schedule:
+    - cron: '17 12 * * *' # 1x por dia, de manhã em Nova York, onde o app vive.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  conferir:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conferir o certificado e o caminho da renovação
+        id: cert
+        env:
+          HOST: sara.energeticseed.com
+          # Endereço direto da VPS. Vive num segredo porque este repositório é
+          # público, e publicar o endereço de origem entregaria justamente a
+          # máquina que a Cloudflare existe pra esconder.
+          # Se um dia a máquina mudar de endereço, esta conferência passa a
+          # falhar e manda e-mail, que é o jeito certo de errar: barulho é melhor
+          # que um vigia calado olhando pro nada.
+          ORIGEM: ${{ secrets.VPS_ORIGEM }}
+        run: |
+          set -uo pipefail
+          if [ -z "${ORIGEM:-}" ]; then
+            echo "AVISO: segredo VPS_ORIGEM não configurado; conferência pulada"
+            echo "alerta=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          PROBLEMAS=""
+
+          # 1) Quantos dias faltam pro NOSSO certificado, o da VPS.
+          DIAS=""
+          for i in 1 2; do
+            FIM=$(echo | openssl s_client -connect "$ORIGEM:443" -servername "$HOST" 2>/dev/null \
+                  | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [ -n "$FIM" ]; then
+              FIM_S=$(date -u -d "$FIM" +%s 2>/dev/null || echo "")
+              if [ -n "$FIM_S" ]; then
+                DIAS=$(( (FIM_S - $(date -u +%s)) / 86400 ))
+                break
+              fi
+            fi
+            echo "tentativa $i: não consegui ler o certificado da VPS"; sleep 10
+          done
+
+          if [ -z "$DIAS" ]; then
+            PROBLEMAS="$PROBLEMAS<li>Não consegui <b>ler o certificado direto na VPS</b> em 2 tentativas. Ou a máquina mudou de endereço, ou parou de atender.</li>"
+          else
+            echo "certificado da VPS vence em $DIAS dias"
+            if [ "$DIAS" -lt 21 ]; then
+              PROBLEMAS="$PROBLEMAS<li>O certificado da VPS vence em <b>$DIAS dias</b>. Ele deveria ter se renovado sozinho faltando 30, então a renovação está falhando há mais de uma semana. Quando vencer, a Cloudflare recusa a VPS e <b>o site sai do ar inteiro</b>.</li>"
+            fi
+          fi
+
+          # 2) O caminho que a renovação usa continua aberto? Se a Cloudflare
+          # passar a barrar este endereço, a renovação quebra em silêncio semanas
+          # antes de o certificado vencer, e ninguém descobre até o site cair.
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+            "http://$HOST/.well-known/acme-challenge/vigia-$(date -u +%s)" || echo "000")
+          echo "caminho da renovação respondeu HTTP $CODIGO"
+          # 404 é o esperado (o desafio não existe, mas chegou no nosso servidor).
+          # Redirecionamento também serve: o Let's Encrypt segue. 403 é a
+          # Cloudflare barrando, e 5xx/000 é o caminho quebrado.
+          case "$CODIGO" in
+            404|200|301|302|308) : ;;
+            *) PROBLEMAS="$PROBLEMAS<li>O <b>caminho da renovação</b> respondeu HTTP $CODIGO (o esperado é 404). Se ele estiver bloqueado, o certificado não se renova e o site cai quando ele vencer.</li>" ;;
+          esac
+
+          if [ -n "$PROBLEMAS" ]; then
+            echo "alerta=<ul>$PROBLEMAS</ul>" >> "$GITHUB_OUTPUT"
+          else
+            echo "alerta=" >> "$GITHUB_OUTPUT"
+            echo "certificado e renovação em ordem"
+          fi
+          exit 0
+
+      - name: Avisar por e-mail se o certificado estiver em risco
+        if: steps.cert.outputs.alerta != ''
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERTA: ${{ steps.cert.outputs.alerta }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESEND_API_KEY:-}" ]; then
+            echo "RESEND_API_KEY ausente; sem e-mail de aviso"; exit 1
+          fi
+          jq -n --arg a "$ALERTA" \
+            '{from:"Energetic Seed <deploy@energeticseed.com>",
+              to:["ferramentas@auramatrix.com.br"],
+              subject:"Certificado do app Energetic Seed precisa de atenção",
+              html:("<p>O app está no ar normalmente, isto é um aviso <b>com antecedência</b>:</p>"
+                    + $a
+                    + "<p>O que fazer: entrar na VPS e olhar o Traefik, que é quem renova. "
+                    + "O comando que mostra o motivo é <code>docker logs $(docker ps --filter name=traefik -q) 2>&amp;1 | grep -i acme</code>.</p>"
+                    + "<p style=\"color:#666;font-size:13px\">Conferência automática, uma vez por dia. Ela olha o certificado direto na VPS, e não pelo endereço do site, porque pelo site quem responde é a Cloudflare.</p>")}' \
+            > /tmp/email-cert.json
+          curl -sS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" -d @/tmp/email-cert.json
+          echo "aviso de certificado enviado"
+          exit 1

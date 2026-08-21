@@ -14,22 +14,37 @@ name: Vigia externo do app
 # este vigia MORREU junto com todo o resto — exatamente o cenário que ele existe
 # pra cobrir. Aqui ele nunca mais fica sem saldo.
 # Nada sensível mora neste arquivo: ele só consulta endereços que já são públicos.
-# O endereço direto da VPS vive no segredo VPS_ORIGEM porque publicá-lo entregaria
-# o servidor de origem que a Cloudflare existe pra esconder.
 #
-# CUSTO HISTÓRICO (mantido pra explicar o intervalo de 2h): o GitHub cobra o mínimo
-# de 1 minuto por execução, e o plano gratuito de repositório privado dá 2000 por mês. De hora em hora dava ~720
-# execuções mensais, e em 06/08/2026 o saldo acabou: as execuções ficaram
-# PRESAS NA FILA sem nunca começar, o CI parou e este vigia foi morto esperando,
-# o que ainda pintou de vermelho um dia em que o app estava perfeitamente de pé.
-# Ficar sem vigia é o pior dos mundos: se a VPS inteira apagar, ninguém avisa.
-# De 2 em 2 horas custa metade (~360 por mês) e a demora máxima pra descobrir
-# uma queda passa de 1 para 2 horas, o que é troca justa por ter o olho aberto.
+# INTERVALO: de 10 em 10 minutos desde 21/08/2026. Antes era de 2 em 2 horas, e o
+# motivo era só dinheiro: o GitHub cobra 1 minuto cheio por execução e o saldo do
+# repositório privado tinha acabado. Em repositório público não custa nada, então
+# a demora máxima pra descobrir uma queda caiu de 2 horas para 10 minutos.
+# O GitHub atrasa execução agendada quando está sob carga, principalmente perto
+# do minuto :00 — então na prática o intervalo varia. Ainda assim é outra ordem
+# de grandeza melhor que 2 horas.
+#
+# A conferência do certificado NÃO mora mais aqui: virou certificado.yml, com
+# agendamento próprio de 1x por dia. Junto neste arquivo ela rodaria 144 vezes
+# por dia e, num dia de problema, mandaria 144 e-mails.
 
 on:
   schedule:
-    - cron: '7 */2 * * *' # de 2 em 2 horas. O minuto 7 evita o pico do :00.
+    - cron: '*/10 * * * *'
   workflow_dispatch: # permite rodar na mão pra testar
+
+permissions:
+  # Só pra ler o histórico das próprias execuções e saber se a anterior já tinha
+  # falhado (é o que segura a enxurrada de e-mail, no passo lá embaixo).
+  actions: read
+  contents: read
+
+# O GitHub às vezes segura várias execuções agendadas e solta todas de uma vez.
+# Sem isto, três vigias simultâneos contam falhas em cima uns dos outros e o
+# freio de e-mail decide errado. `cancel-in-progress: false` porque cancelar um
+# vigia no meio é jogar fora justamente a checagem que talvez fosse alertar.
+concurrency:
+  group: vigia
+  cancel-in-progress: false
 
 jobs:
   verificar:
@@ -58,152 +73,76 @@ jobs:
           [ "$OK" = "1" ] && echo "app respondendo normalmente"
           exit 0
 
-      # CONFERÊNCIA DO CERTIFICADO, UMA VEZ POR DIA.
+      # O FREIO DE E-MAIL.
       #
-      # Pega carona numa execução que já ia acontecer de qualquer jeito, então
-      # não gasta minuto nenhum a mais do saldo do GitHub, que já acabou uma vez
-      # (ver o comentário lá em cima).
+      # Com o vigia de 10 em 10 minutos, um app fora do ar por um dia dispararia
+      # 144 e-mails. Além de inútil (o primeiro já disse tudo), volume assim
+      # queima a reputação do domínio no Resend e derruba a entrega dos e-mails
+      # que importam, os que vão pras clientes.
       #
-      # POR QUE OLHAR A VPS DIRETO, E NÃO O ENDEREÇO DO SITE. Desde 10/08/2026 a
-      # Cloudflare atende na frente. Quem pergunta o certificado de
-      # `sara.energeticseed.com` recebe o DELA, que ela renova sozinha e não é
-      # problema nosso. O nosso é o Let's Encrypt que vive na VPS, e ele só
-      # aparece perguntando direto ao endereço da máquina. Vigiar o endereço
-      # público daria "tudo certo" para sempre, inclusive no dia em que o nosso
-      # vencesse.
-      #
-      # E POR QUE O NOSSO AINDA IMPORTA. Com a Cloudflare em Full (strict), ela
-      # confere o nosso certificado antes de falar com a VPS. Se ele vencer, ela
-      # recusa e o site sai do ar inteiro, mesmo com o servidor perfeito.
-      #
-      # O Traefik renova sozinho faltando 30 dias. Abaixo de 21 significa que a
-      # renovação já falhou por mais de uma semana em silêncio, que é exatamente
-      # o tipo de defeito que este vigia existe pra pegar.
-      - name: Conferir o certificado e o caminho da renovação
-        id: cert
-        # Só quando o app respondeu: se a VPS inteira caiu, o e-mail que importa
-        # é o outro, e este viraria barulho em cima de quem já está apagando
-        # incêndio. A escolha do dia e da hora fica no script, logo abaixo.
-        if: steps.check.outputs.ok == '1'
+      # Como funciona sem guardar estado em lugar nenhum: pergunta ao próprio
+      # GitHub quantas execuções SEGUIDAS antes desta já tinham falhado. Este
+      # workflow só fica vermelho por um motivo — o app não respondeu — então a
+      # contagem é exata. (Foi por isso que a conferência do certificado saiu
+      # daqui: ela também deixava a execução vermelha e bagunçaria a conta.)
+      - name: Ver há quanto tempo já está caído
+        id: hist
+        if: steps.check.outputs.ok != '1'
         env:
-          HOST: sara.energeticseed.com
-          # Endereço da VPS. Se um dia a máquina mudar de endereço, esta
-          # conferência passa a falhar e manda e-mail, que é o jeito certo de
-          # errar: barulho é melhor que um vigia calado olhando pro nada.
-          ORIGEM: ${{ secrets.VPS_ORIGEM }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          if [ -z "${ORIGEM:-}" ]; then
-            echo "AVISO: segredo VPS_ORIGEM não configurado; conferência do certificado pulada"
-            echo "alerta=" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          # Só uma vez por dia, de manhã em Nova York, onde o app vive.
-          #
-          # A janela é de DUAS horas de propósito. O gatilho roda em horas pares,
-          # então só a execução das 12h cai aqui dentro, e ela não repete. Mas o
-          # GitHub atrasa execução agendada quando está cheio, e com uma janela de
-          # uma hora só um atraso de 20 minutos faria a conferência ser pulada
-          # calada, que é o pior jeito de um vigia falhar.
-          HORA=$(date -u +%H)
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$HORA" != "12" ] && [ "$HORA" != "13" ]; then
-            echo "agora são ${HORA}h UTC, fora da janela da conferência diária; pulando"
-            echo "alerta=" >> "$GITHUB_OUTPUT"; exit 0
-          fi
+          # Posição da primeira execução bem-sucedida na lista = quantas falharam
+          # seguidas antes desta. Sem nenhuma bem-sucedida na janela, usa o total.
+          SEGUIDAS=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows/monitor.yml/runs?per_page=30&status=completed" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | .conclusion]
+                  | (index("success") // length)' 2>/dev/null || echo 0)
+          SEGUIDAS=${SEGUIDAS:-0}
+          echo "falhas seguidas antes desta: $SEGUIDAS"
 
-          PROBLEMAS=""
-
-          # 1) Quantos dias faltam pro NOSSO certificado, o da VPS.
-          DIAS=""
-          for i in 1 2; do
-            FIM=$(echo | openssl s_client -connect "$ORIGEM:443" -servername "$HOST" 2>/dev/null \
-                  | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
-            if [ -n "$FIM" ]; then
-              FIM_S=$(date -u -d "$FIM" +%s 2>/dev/null || echo "")
-              if [ -n "$FIM_S" ]; then
-                DIAS=$(( (FIM_S - $(date -u +%s)) / 86400 ))
-                break
-              fi
-            fi
-            echo "tentativa $i: não consegui ler o certificado da VPS"; sleep 10
-          done
-
-          if [ -z "$DIAS" ]; then
-            PROBLEMAS="$PROBLEMAS<li>Não consegui <b>ler o certificado direto na VPS</b> ($ORIGEM) em 2 tentativas. Ou a máquina mudou de endereço, ou parou de atender.</li>"
+          # Manda no primeiro tombo, depois no máximo 1 por hora (6 checagens).
+          if [ "$SEGUIDAS" -eq 0 ] || [ $(( SEGUIDAS % 6 )) -eq 0 ]; then
+            echo "avisar=1" >> "$GITHUB_OUTPUT"
           else
-            echo "certificado da VPS vence em $DIAS dias"
-            if [ "$DIAS" -lt 21 ]; then
-              PROBLEMAS="$PROBLEMAS<li>O certificado da VPS vence em <b>$DIAS dias</b>. Ele deveria ter se renovado sozinho faltando 30, então a renovação está falhando há mais de uma semana. Quando vencer, a Cloudflare recusa a VPS e <b>o site sai do ar inteiro</b>.</li>"
-            fi
+            echo "avisar=0" >> "$GITHUB_OUTPUT"
+            echo "já avisei há menos de 1 hora; segurando o e-mail"
           fi
-
-          # 2) O caminho que a renovação usa continua aberto? Se a Cloudflare
-          # passar a barrar este endereço, a renovação quebra em silêncio semanas
-          # antes de o certificado vencer, e ninguém descobre até o site cair.
-          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-            "http://$HOST/.well-known/acme-challenge/vigia-$(date -u +%s)" || echo "000")
-          echo "caminho da renovação respondeu HTTP $CODIGO"
-          # 404 é o esperado (o desafio não existe, mas chegou no nosso servidor).
-          # Redirecionamento também serve: o Let's Encrypt segue. 403 é a
-          # Cloudflare barrando, e 5xx/000 é o caminho quebrado.
-          case "$CODIGO" in
-            404|200|301|302|308) : ;;
-            *) PROBLEMAS="$PROBLEMAS<li>O <b>caminho da renovação</b> respondeu HTTP $CODIGO (o esperado é 404). Se ele estiver bloqueado, o certificado não se renova e o site cai quando ele vencer.</li>" ;;
-          esac
-
-          if [ -n "$PROBLEMAS" ]; then
-            echo "alerta=<ul>$PROBLEMAS</ul>" >> "$GITHUB_OUTPUT"
-          else
-            echo "alerta=" >> "$GITHUB_OUTPUT"
-            echo "certificado e renovação em ordem"
-          fi
+          MIN=$(( (SEGUIDAS + 1) * 10 ))
+          echo "ha_quanto=$MIN" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Avisar por e-mail se o certificado estiver em risco
-        if: steps.cert.outputs.alerta != ''
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          ALERTA: ${{ steps.cert.outputs.alerta }}
-        run: |
-          set -euo pipefail
-          if [ -z "${RESEND_API_KEY:-}" ]; then
-            echo "RESEND_API_KEY ausente; sem e-mail de aviso"; exit 1
-          fi
-          jq -n --arg a "$ALERTA" \
-            '{from:"Energetic Seed <deploy@energeticseed.com>",
-              to:["ferramentas@auramatrix.com.br"],
-              subject:"Certificado do app Energetic Seed precisa de atenção",
-              html:("<p>O app está no ar normalmente, isto é um aviso <b>com antecedência</b>:</p>"
-                    + $a
-                    + "<p>O que fazer: entrar na VPS e olhar o Traefik, que é quem renova. "
-                    + "O comando que mostra o motivo é <code>docker logs $(docker ps --filter name=traefik -q) 2>&amp;1 | grep -i acme</code>.</p>"
-                    + "<p style=\"color:#666;font-size:13px\">Conferência automática, uma vez por dia. Ela olha o certificado direto na VPS, e não pelo endereço do site, porque pelo site quem responde é a Cloudflare.</p>")}' \
-            > /tmp/email-cert.json
-          curl -sS -X POST https://api.resend.com/emails \
-            -H "Authorization: Bearer $RESEND_API_KEY" \
-            -H "Content-Type: application/json" -d @/tmp/email-cert.json
-          echo "aviso de certificado enviado"
-          exit 1
-
       - name: Avisar por e-mail se não respondeu
-        if: steps.check.outputs.ok != '1'
+        if: steps.check.outputs.ok != '1' && steps.hist.outputs.avisar == '1'
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           CODIGO: ${{ steps.check.outputs.codigo }}
+          HA_QUANTO: ${{ steps.hist.outputs.ha_quanto }}
         run: |
           set -euo pipefail
           if [ -z "${RESEND_API_KEY:-}" ]; then
             echo "RESEND_API_KEY ausente; sem e-mail de aviso"; exit 1
           fi
-          jq -n --arg c "$CODIGO" \
+          jq -n --arg c "$CODIGO" --arg m "$HA_QUANTO" \
             '{from:"Energetic Seed <deploy@energeticseed.com>",
               to:["ferramentas@auramatrix.com.br"],
               subject:"O app Energetic Seed não está respondendo",
               html:("<p>De fora do servidor, o app <b>não respondeu</b> em 3 tentativas seguidas (última resposta: HTTP " + $c + ").</p>"
+                    + "<p>Está assim há pelo menos <b>" + $m + " minutos</b>.</p>"
                     + "<p>Como esta checagem roda no GitHub e não na VPS, isto costuma significar que o <b>servidor inteiro</b> está fora do ar, e não só o app.</p>"
-                    + "<p style=\"color:#666;font-size:13px\">Verificação automática, de hora em hora.</p>")}' \
+                    + "<p style=\"color:#666;font-size:13px\">Verificação automática, de 10 em 10 minutos. Enquanto continuar fora do ar você recebe no máximo <b>um aviso por hora</b>, não um a cada checagem.</p>")}' \
             > /tmp/email.json
           curl -sS -X POST https://api.resend.com/emails \
             -H "Authorization: Bearer $RESEND_API_KEY" \
             -H "Content-Type: application/json" -d @/tmp/email.json
           echo "aviso enviado"
+
+      # A execução precisa ficar VERMELHA sempre que o app estiver fora, mesmo
+      # quando o e-mail foi segurado pelo freio. É essa cor que o passo do freio
+      # conta na próxima vez — se um vigia que não avisou ficasse verde, a conta
+      # zeraria e o e-mail voltaria a sair de 10 em 10 minutos.
+      - name: Marcar a execução como falha
+        if: steps.check.outputs.ok != '1'
+        run: |
+          echo "app fora do ar; execução marcada como falha (é o que alimenta o freio)"
           exit 1
