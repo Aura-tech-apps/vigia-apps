@@ -37,6 +37,12 @@ name: Vigia externo do app
 on:
   schedule:
     - cron: '3,13,23,33,43,53 * * * *'
+    # CHÃO DE SEGURANÇA. Este é o agendamento antigo, o único com confiabilidade
+    # comprovada em produção: 243 execuções em 20 dias contra 240 esperadas. Ele
+    # fica aqui de propósito, junto com o de 10 minutos, pra garantir que o pior
+    # caso NUNCA seja pior do que era antes — se o GitHub engolir as execuções
+    # frequentes, esta ainda passa. Não remover sem ter medido o substituto.
+    - cron: '7 */2 * * *'
   workflow_dispatch: # permite rodar na mão pra testar
 
 permissions:
