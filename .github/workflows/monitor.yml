@@ -19,9 +19,16 @@ name: Vigia externo do app
 # motivo era só dinheiro: o GitHub cobra 1 minuto cheio por execução e o saldo do
 # repositório privado tinha acabado. Em repositório público não custa nada, então
 # a demora máxima pra descobrir uma queda caiu de 2 horas para 10 minutos.
-# O GitHub atrasa execução agendada quando está sob carga, principalmente perto
-# do minuto :00 — então na prática o intervalo varia. Ainda assim é outra ordem
-# de grandeza melhor que 2 horas.
+# MEDIDO EM 21/08/2026, e a lição custou uma hora: com `*/10 * * * *` o GitHub
+# disparou UMA vez em 42 minutos, não quatro. Com o cron de 2 em 2 horas que
+# existia antes, 243 execuções em 20 dias contra 240 esperadas — 100%. Ou seja,
+# não é atraso: o GitHub DESCARTA execução agendada frequente demais, e o
+# `*/10` ainda por cima cai no minuto :00, que é o pico que a própria
+# documentação dele manda evitar.
+# Por isso os minutos são explícitos e ímpares (3, 13, 23...): mesmo intervalo de
+# 10 minutos, nunca no pico. Se ainda assim o GitHub engolir execuções, o jeito
+# certo de ter 10 minutos de verdade é um serviço dedicado de monitoramento —
+# agendador do Actions não foi feito pra isso.
 #
 # A conferência do certificado NÃO mora mais aqui: virou certificado.yml, com
 # agendamento próprio de 1x por dia. Junto neste arquivo ela rodaria 144 vezes
@@ -29,7 +36,7 @@ name: Vigia externo do app
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch: # permite rodar na mão pra testar
 
 permissions:
