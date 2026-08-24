@@ -26,9 +26,21 @@ para esconder.
 
 | Arquivo | Quando | O que olha | Quando avisa |
 |---|---|---|---|
-| `monitor.yml` | De 10 em 10 min | O app responde? (3 tentativas, conferindo o conteúdo) | Não respondeu nenhuma vez |
+| `monitor.yml` | De 10 em 10 min | O app Energetic Seed responde? (3 tentativas, conferindo o conteúdo) | Não respondeu nenhuma vez |
+| `monitor-aurachat.yml` | De 10 em 10 min | O Aura Chat consegue **gravar** no banco? (sonda profunda) | Não respondeu nenhuma vez |
+| `monitor-sara.yml` | De 10 em 10 min | A Sara do WhatsApp responde, com banco e Redis de pé? | Não respondeu nenhuma vez |
 | `certificado.yml` | 1x por dia | Validade do certificado direto na VPS | Falta menos de 21 dias |
 | `certificado.yml` | 1x por dia | O caminho de renovação do certificado está aberto? | Respondeu algo fora do esperado |
+
+**Um arquivo por aplicativo, de propósito.** O freio de e-mail (abaixo) conta
+quantas execuções seguidas do MESMO arquivo falharam. Se dois aplicativos
+dividissem um arquivo, a queda de um contaminaria a contagem do outro e o
+primeiro aviso de uma queda nova poderia ser engolido como se fosse continuação
+da anterior.
+
+**Cada um bate num endereço com `/api` na frente.** Sem isso, o servidor entrega
+a página do painel — 200 com HTML — e o vigia fica verde para sempre com o
+aplicativo morto.
 
 ## O freio de e-mail
 

@@ -1,0 +1,138 @@
+name: Vigia externo da Sara (Brasil)
+
+# POR QUE ISTO EXISTE
+# A Sara do Brasil (`tarot.suportesam.com`) é o atendimento inteiro do WhatsApp:
+# quando ela cai, a cliente escreve e não recebe nada — e do lado dela a mensagem
+# parece ter chegado, porque o webhook da Meta responde 200 antes de qualquer
+# processamento. Foi exatamente essa cena em 09/08/2026, com os workers mortos e
+# a API de pé: 224 mensagens represadas, 8 horas, e ninguém soube até uma cliente
+# reclamar por e-mail.
+#
+# Depois daquilo nasceram três travas DENTRO do produto (batida de vida do worker,
+# vigia de fila, política de reinício do Swarm). Todas moram na VPS. Nenhuma
+# sobrevive à VPS inteira apagando — e a auditoria de 22/08/2026 apontou que o
+# único olho de fora, este repositório, olhava o app Energetic Seed e o Aura Chat,
+# mas NÃO a Sara.
+#
+# POR QUE `/api/health/ready` E NÃO `/health/ready`
+# Sem o `/api`, o Traefik entrega o caminho pro PAINEL (React) e a resposta é
+# 200 com HTML — verde eterno, com a API morta. Medido em 24/08/2026. O `/ready`
+# com `/api` na frente pinga banco e Redis de verdade e é o que enxerga a Sara
+# viva mas incapaz de responder.
+#
+# POR QUE UM ARQUIVO SEPARADO, E NÃO MAIS UM PASSO NUM VIGIA EXISTENTE
+# O freio de e-mail conta quantas execuções SEGUIDAS deste workflow falharam, e a
+# conta só é exata porque o workflow fica vermelho por UM motivo. Juntar dois apps
+# faz a queda de um contaminar a contagem do outro, e o primeiro aviso de uma
+# queda nova pode ser segurado como se fosse continuação da anterior. Mesma razão
+# que separou o certificado e o Aura Chat.
+#
+# INTERVALO: os mesmos 10 minutos dos outros dois, com os minutos DESLOCADOS
+# (9, 19, 29...) pra os três não caírem no mesmo instante — e nunca no minuto :00,
+# que a documentação do GitHub manda evitar e que faz ele engolir execução. O cron
+# de 2 em 2 horas fica como chão de segurança, pelo motivo documentado no
+# monitor.yml: é o único agendamento com confiabilidade medida em produção.
+
+on:
+  schedule:
+    - cron: '9,19,29,39,49,59 * * * *'
+    - cron: '15 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: vigia-sara
+  cancel-in-progress: false
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bater na porta da Sara
+        id: check
+        run: |
+          set -uo pipefail
+          OK=0
+          # Três tentativas espaçadas: um soluço de rede não vale um e-mail.
+          # Confere o CONTEÚDO, não o código HTTP: durante a troca de containers
+          # o Traefik entrega este caminho pro painel React, que responde 200 com
+          # HTML. Olhar só o código diria "tudo bem" com a Sara morta.
+          for i in 1 2 3; do
+            CORPO=$(curl -s --max-time 15 https://tarot.suportesam.com/api/health/ready || echo "")
+            CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+              https://tarot.suportesam.com/api/health/ready || echo "000")
+            case "$CORPO" in *'"status":"ok"'*) OK=1;; esac
+            [ "$OK" = "1" ] && break
+            echo "tentativa $i: HTTP $CODIGO, corpo não é o do health"
+            sleep 20
+          done
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
+          echo "codigo=${CODIGO:-000}" >> "$GITHUB_OUTPUT"
+          [ "$OK" = "1" ] && echo "Sara respondendo normalmente"
+          exit 0
+
+      # O FREIO DE E-MAIL — mesma mecânica dos outros vigias: pergunta ao próprio
+      # GitHub quantas execuções SEGUIDAS antes desta já tinham falhado, sem
+      # guardar estado em lugar nenhum.
+      - name: Ver há quanto tempo já está caída
+        id: hist
+        if: steps.check.outputs.ok != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          SEGUIDAS=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows/monitor-sara.yml/runs?per_page=30&status=completed" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | .conclusion]
+                  | (index("success") // length)' 2>/dev/null || echo 0)
+          SEGUIDAS=${SEGUIDAS:-0}
+          echo "falhas seguidas antes desta: $SEGUIDAS"
+
+          # Manda no primeiro tombo, depois no máximo 1 por hora (6 checagens).
+          if [ "$SEGUIDAS" -eq 0 ] || [ $(( SEGUIDAS % 6 )) -eq 0 ]; then
+            echo "avisar=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "avisar=0" >> "$GITHUB_OUTPUT"
+            echo "já avisei há menos de 1 hora; segurando o e-mail"
+          fi
+          MIN=$(( (SEGUIDAS + 1) * 10 ))
+          echo "ha_quanto=$MIN" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Avisar por e-mail se não respondeu
+        if: steps.check.outputs.ok != '1' && steps.hist.outputs.avisar == '1'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          CODIGO: ${{ steps.check.outputs.codigo }}
+          HA_QUANTO: ${{ steps.hist.outputs.ha_quanto }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESEND_API_KEY:-}" ]; then
+            echo "RESEND_API_KEY ausente; sem e-mail de aviso"; exit 1
+          fi
+          jq -n --arg c "$CODIGO" --arg m "$HA_QUANTO" \
+            '{from:"Energetic Seed <deploy@energeticseed.com>",
+              to:["ferramentas@auramatrix.com.br"],
+              subject:"A Sara do WhatsApp não está respondendo",
+              html:("<p>De fora do servidor, a Sara do Brasil <b>não respondeu</b> em 3 tentativas seguidas (última resposta: HTTP " + $c + ").</p>"
+                    + "<p>Está assim há pelo menos <b>" + $m + " minutos</b>.</p>"
+                    + "<p>Enquanto isso, quem escrever no WhatsApp <b>não recebe resposta</b> — e do lado da cliente a mensagem parece ter chegado normalmente.</p>"
+                    + "<p>Como esta checagem roda no GitHub e não na VPS, isto costuma significar que o <b>servidor inteiro</b> está fora do ar, e não só a Sara.</p>"
+                    + "<p style=\"color:#666;font-size:13px\">Verificação automática, de 10 em 10 minutos. Enquanto continuar fora do ar você recebe no máximo <b>um aviso por hora</b>, não um a cada checagem.</p>")}' \
+            > /tmp/email.json
+          curl -sS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" -d @/tmp/email.json
+          echo "aviso enviado"
+
+      # A execução precisa ficar VERMELHA sempre que a Sara estiver fora, mesmo
+      # quando o e-mail foi segurado pelo freio: é essa cor que o passo do freio
+      # conta na próxima vez.
+      - name: Marcar a execução como falha
+        if: steps.check.outputs.ok != '1'
+        run: |
+          echo "Sara fora do ar; execução marcada como falha (é o que alimenta o freio)"
+          exit 1
