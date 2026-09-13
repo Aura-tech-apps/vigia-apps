@@ -1,0 +1,133 @@
+name: Vigia externo da Semilla (espanhol)
+
+# Mesmo desenho do monitor.yml (ler aquele cabecalho), para a versao em
+# ESPANHOL lancada em 13/09/2026: o app https://app.semillaenergetica.com e a
+# Sara em espanhol (https://tarot.suportesam.com/api-es). Arquivo separado de
+# proposito: o freio de e-mail conta as execucoes vermelhas DESTE workflow, e
+# misturar os dois apps faria uma queda de um segurar o aviso do outro.
+
+on:
+  schedule:
+    - cron: '5,15,25,35,45,55 * * * *'
+    # CHÃO DE SEGURANÇA. Este é o agendamento antigo, o único com confiabilidade
+    # comprovada em produção: 243 execuções em 20 dias contra 240 esperadas. Ele
+    # fica aqui de propósito, junto com o de 10 minutos, pra garantir que o pior
+    # caso NUNCA seja pior do que era antes — se o GitHub engolir as execuções
+    # frequentes, esta ainda passa. Não remover sem ter medido o substituto.
+    - cron: '9 */2 * * *'
+  workflow_dispatch: # permite rodar na mão pra testar
+
+permissions:
+  # Só pra ler o histórico das próprias execuções e saber se a anterior já tinha
+  # falhado (é o que segura a enxurrada de e-mail, no passo lá embaixo).
+  actions: read
+  contents: read
+
+# O GitHub às vezes segura várias execuções agendadas e solta todas de uma vez.
+# Sem isto, três vigias simultâneos contam falhas em cima uns dos outros e o
+# freio de e-mail decide errado. `cancel-in-progress: false` porque cancelar um
+# vigia no meio é jogar fora justamente a checagem que talvez fosse alertar.
+concurrency:
+  group: vigia-semilla
+  cancel-in-progress: false
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bater na porta do app
+        id: check
+        run: |
+          set -uo pipefail
+          OK=0
+          # Três tentativas espaçadas: um soluço de rede não vale um e-mail.
+          # Confere o CONTEÚDO: durante a troca de containers o Traefik entrega
+          # o /api/health pro site estático, que responde 200 com HTML. Olhar só
+          # o código HTTP diria "tudo bem" com a API morta.
+          for i in 1 2 3; do
+            CORPO=$(curl -s --max-time 15 https://app.semillaenergetica.com/api/health || echo "")
+            CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+              https://tarot.suportesam.com/api-es/health/ready || echo "000")
+            case "$CORPO" in *'"ok":true'*) [ "$CODIGO" = "200" ] && OK=1;; esac
+            [ "$OK" = "1" ] && break
+            echo "tentativa $i: app sem health ok ou Sara ES com HTTP $CODIGO"
+            sleep 20
+          done
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
+          echo "codigo=${CODIGO:-000}" >> "$GITHUB_OUTPUT"
+          [ "$OK" = "1" ] && echo "app respondendo normalmente"
+          exit 0
+
+      # O FREIO DE E-MAIL.
+      #
+      # Com o vigia de 10 em 10 minutos, um app fora do ar por um dia dispararia
+      # 144 e-mails. Além de inútil (o primeiro já disse tudo), volume assim
+      # queima a reputação do domínio no Resend e derruba a entrega dos e-mails
+      # que importam, os que vão pras clientes.
+      #
+      # Como funciona sem guardar estado em lugar nenhum: pergunta ao próprio
+      # GitHub quantas execuções SEGUIDAS antes desta já tinham falhado. Este
+      # workflow só fica vermelho por um motivo — o app não respondeu — então a
+      # contagem é exata. (Foi por isso que a conferência do certificado saiu
+      # daqui: ela também deixava a execução vermelha e bagunçaria a conta.)
+      - name: Ver há quanto tempo já está caído
+        id: hist
+        if: steps.check.outputs.ok != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Posição da primeira execução bem-sucedida na lista = quantas falharam
+          # seguidas antes desta. Sem nenhuma bem-sucedida na janela, usa o total.
+          SEGUIDAS=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows/monitor-semilla.yml/runs?per_page=30&status=completed" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | .conclusion]
+                  | (index("success") // length)' 2>/dev/null || echo 0)
+          SEGUIDAS=${SEGUIDAS:-0}
+          echo "falhas seguidas antes desta: $SEGUIDAS"
+
+          # Manda no primeiro tombo, depois no máximo 1 por hora (6 checagens).
+          if [ "$SEGUIDAS" -eq 0 ] || [ $(( SEGUIDAS % 6 )) -eq 0 ]; then
+            echo "avisar=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "avisar=0" >> "$GITHUB_OUTPUT"
+            echo "já avisei há menos de 1 hora; segurando o e-mail"
+          fi
+          MIN=$(( (SEGUIDAS + 1) * 10 ))
+          echo "ha_quanto=$MIN" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Avisar por e-mail se não respondeu
+        if: steps.check.outputs.ok != '1' && steps.hist.outputs.avisar == '1'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          CODIGO: ${{ steps.check.outputs.codigo }}
+          HA_QUANTO: ${{ steps.hist.outputs.ha_quanto }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESEND_API_KEY:-}" ]; then
+            echo "RESEND_API_KEY ausente; sem e-mail de aviso"; exit 1
+          fi
+          jq -n --arg c "$CODIGO" --arg m "$HA_QUANTO" \
+            '{from:"Energetic Seed <deploy@energeticseed.com>",
+              to:["ferramentas@auramatrix.com.br"],
+              subject:"[ES] Semilla Energética não está respondendo",
+              html:("<p>De fora do servidor, a versão em espanhol (app Semilla Energética ou a Sara em espanhol) <b>não respondeu</b> em 3 tentativas seguidas (Sara ES: HTTP " + $c + ").</p>"
+                    + "<p>Está assim há pelo menos <b>" + $m + " minutos</b>.</p>"
+                    + "<p>Como esta checagem roda no GitHub e não na VPS, isto costuma significar que o <b>servidor inteiro</b> está fora do ar, e não só o app.</p>"
+                    + "<p style=\"color:#666;font-size:13px\">Verificação automática, de 10 em 10 minutos. Enquanto continuar fora do ar você recebe no máximo <b>um aviso por hora</b>, não um a cada checagem.</p>")}' \
+            > /tmp/email.json
+          curl -sS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" -d @/tmp/email.json
+          echo "aviso enviado"
+
+      # A execução precisa ficar VERMELHA sempre que o app estiver fora, mesmo
+      # quando o e-mail foi segurado pelo freio. É essa cor que o passo do freio
+      # conta na próxima vez — se um vigia que não avisou ficasse verde, a conta
+      # zeraria e o e-mail voltaria a sair de 10 em 10 minutos.
+      - name: Marcar a execução como falha
+        if: steps.check.outputs.ok != '1'
+        run: |
+          echo "app fora do ar; execução marcada como falha (é o que alimenta o freio)"
+          exit 1
