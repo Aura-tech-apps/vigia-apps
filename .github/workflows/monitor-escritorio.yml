@@ -1,0 +1,118 @@
+name: Vigia externo do Escritório Aura
+
+# POR QUE ISTO EXISTE (20/10/2026)
+# O Escritório Aura é o painel que vigia todos os apps e manda os avisos. Se ele mesmo travar, ninguém avisa:
+# por isso este vigia de fora confere o /saude dele, que responde "ok" só quando a coleta está andando
+# (coleta parada há 10 min = 503). O endereço fica no segredo ESCRITORIO_SAUDE_URL e não no arquivo,
+# porque ele contém o IP da VPS (mesma regra do VPS_ORIGEM).
+
+on:
+  schedule:
+    - cron: '9,19,29,39,49,59 * * * *'
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: vigia-escritorio
+  cancel-in-progress: false
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bater na porta do Escritório
+        id: check
+        env:
+          URL: ${{ secrets.ESCRITORIO_SAUDE_URL }}
+        run: |
+          set -uo pipefail
+          OK=0
+          MOTIVO=""
+          # Três tentativas espaçadas: um soluço de rede não vale um e-mail.
+          # Confere o CONTEÚDO, não só o código: durante a troca de containers o
+          # Traefik pode entregar a rota da API pro site estático, que responde
+          # 200 com HTML. Olhar só o HTTP diria "tudo bem" com a API morta.
+          for i in 1 2 3; do
+            CORPO=$(curl -s --max-time 20 "$URL" || echo "")
+            CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+              "$URL" || echo "000")
+            [ "$CORPO" = "ok" ] && OK=1
+            [ "$OK" = "1" ] && break
+            # Guarda o motivo que o próprio app deu: ele diz se quem falhou foi
+            # o banco (e se foi na escrita) ou o Redis, e isso vai no e-mail —
+            # sem isso o aviso obriga alguém a ir investigar do zero.
+            MOTIVO=$(printf '%s' "$CORPO" | head -c 400 | tr -d '\n')
+            echo "tentativa $i: HTTP $CODIGO — $MOTIVO"
+            sleep 20
+          done
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
+          echo "codigo=${CODIGO:-000}" >> "$GITHUB_OUTPUT"
+          {
+            echo 'motivo<<FIM'
+            echo "${MOTIVO:-sem resposta do app}"
+            echo 'FIM'
+          } >> "$GITHUB_OUTPUT"
+          [ "$OK" = "1" ] && echo "Escritório coletando normalmente"
+          exit 0
+
+      # O FREIO DE E-MAIL — mesma mecânica do monitor.yml, contando as execuções
+      # DESTE arquivo: primeiro tombo avisa na hora, depois no máximo 1 por hora.
+      - name: Ver há quanto tempo já está com problema
+        id: hist
+        if: steps.check.outputs.ok != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          SEGUIDAS=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows/monitor-escritorio.yml/runs?per_page=30&status=completed" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | .conclusion]
+                  | (index("success") // length)' 2>/dev/null || echo 0)
+          SEGUIDAS=${SEGUIDAS:-0}
+          echo "falhas seguidas antes desta: $SEGUIDAS"
+          if [ "$SEGUIDAS" -eq 0 ] || [ $(( SEGUIDAS % 6 )) -eq 0 ]; then
+            echo "avisar=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "avisar=0" >> "$GITHUB_OUTPUT"
+            echo "já avisei há menos de 1 hora; segurando o e-mail"
+          fi
+          MIN=$(( (SEGUIDAS + 1) * 10 ))
+          echo "ha_quanto=$MIN" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Avisar por e-mail
+        if: steps.check.outputs.ok != '1' && steps.hist.outputs.avisar == '1'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          CODIGO: ${{ steps.check.outputs.codigo }}
+          HA_QUANTO: ${{ steps.hist.outputs.ha_quanto }}
+          MOTIVO: ${{ steps.check.outputs.motivo }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESEND_API_KEY:-}" ]; then
+            echo "RESEND_API_KEY ausente; sem e-mail de aviso"; exit 1
+          fi
+          jq -n --arg c "$CODIGO" --arg m "$HA_QUANTO" --arg r "$MOTIVO" \
+            '{from:"Energetic Seed <deploy@energeticseed.com>",
+              to:["ferramentas@auramatrix.com.br"],
+              subject:"O Escritório Aura parou",
+              html:("<p>De fora do servidor, o <b>Escritório Aura</b> não passou na verificação em 3 tentativas seguidas (última resposta: HTTP " + $c + ").</p>"
+                    + "<p>Está assim há pelo menos <b>" + $m + " minutos</b>. Enquanto ele estiver parado, os avisos dos apps NÃO chegam.</p>"
+                    + "<p><b>O que respondeu:</b><br><code style=\"font-size:12px\">" + $r + "</code></p>"
+                    + "<p style=\"color:#666;font-size:13px\">Verificação automática de 10 em 10 minutos. Enquanto continuar com problema você recebe no máximo <b>um aviso por hora</b>.</p>")}' \
+            > /tmp/email-escritorio.json
+          curl -sS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" -d @/tmp/email-escritorio.json
+          echo "aviso enviado"
+
+      # Vermelho alimenta o freio na próxima execução — ver monitor.yml.
+      - name: Marcar a execução como falha
+        if: steps.check.outputs.ok != '1'
+        run: |
+          echo "Escritório com problema; execução marcada como falha (é o que alimenta o freio)"
+          exit 1
