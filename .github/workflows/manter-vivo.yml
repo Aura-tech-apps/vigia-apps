@@ -1,0 +1,51 @@
+name: Manter vivo
+
+# POR QUE ISTO EXISTE (13/11/2026)
+# O GitHub DESLIGA sozinho todos os agendamentos de um repositório público que fica 60 dias
+# sem commit. Este repositório só roda vigia e quase nunca recebe mudança: em 13/11/2026 ele
+# estava há 24 dias parado e cairia perto de 19/12/2026, levando junto o ÚNICO olho de fora
+# da VPS (inclusive o vigia do Escritório). A dona: "fazer de tudo para nunca deixar isso acontecer".
+#
+# Três travas, de propósito:
+#  1) este arquivo faz um commit mínimo DUAS vezes por mês (dias 1 e 15). Se o GitHub
+#     pular uma rodada, a outra ainda chega muito antes dos 60 dias;
+#  2) no mesmo passo ele RELIGA qualquer agendamento deste repositório que esteja desligado;
+#  3) o Escritório Aura confere de 15 em 15 min, pela API pública, se algum agendamento
+#     daqui foi desligado, se um vigia parou de rodar ou se passaram 40 dias sem commit
+#     (src/fontes/vigias-de-fora.js no repositório escritorio), e avisa por e-mail.
+# NAO REMOVER.
+
+on:
+  schedule:
+    # Minuto quebrado de propósito, nunca :00 (o GitHub descarta rodadas no pico).
+    - cron: '17 5 1,15 * *'   # dias 1 e 15, 02h17 de Brasília
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  manter-vivo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Religa agendamento desligado
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state != "active") | .id' | while read -r id; do
+            echo "religando o agendamento $id"
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/enable"
+          done
+      - name: Marca atividade
+        run: |
+          set -eu
+          date -u +"ultima marca de atividade: %Y-%m-%d" > VIVO.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VIVO.txt
+          git diff --staged --quiet || git commit -m "manter-vivo: mantem os agendamentos ativos"
+          git push
