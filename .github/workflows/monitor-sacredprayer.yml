@@ -44,18 +44,21 @@ jobs:
           # Confere o CONTEÚDO: durante a troca de containers o Traefik entrega
           # o /api/health pro site estático, que responde 200 com HTML. Olhar só
           # o código HTTP diria "tudo bem" com a API morta.
-          # Dois enderecos: o app (health com "ok":true) e a pagina de venda na raiz (Cloudflare; tem de
+          # Tres conferencias: o app (health com "ok":true), o banco do app (/api/health/banco) e a pagina de venda na raiz (Cloudflare; tem de
           # responder 200 com o titulo do produto, senao quem clica no anuncio cai no vazio).
           for i in 1 2 3; do
             CORPO=$(curl -s --max-time 15 https://app.thesacredprayer.app/api/health || echo "")
+            BANCO=$(curl -s --max-time 15 https://app.thesacredprayer.app/api/health/banco || echo "")
             PAGINA=$(curl -s --max-time 15 https://thesacredprayer.app/ || echo "")
             CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
               https://thesacredprayer.app/ || echo "000")
             case "$CORPO" in *'"ok":true'*)
-              case "$PAGINA" in *'The Sacred Prayer'*) [ "$CODIGO" = "200" ] && OK=1;; esac;;
+              case "$BANCO" in *'"banco":true'*)
+                case "$PAGINA" in *'The Sacred Prayer'*) [ "$CODIGO" = "200" ] && OK=1;; esac;;
+              esac;;
             esac
             [ "$OK" = "1" ] && break
-            echo "tentativa $i: app sem health ok ou pagina de venda com HTTP $CODIGO"
+            echo "tentativa $i: app, banco do app ou pagina de venda (HTTP $CODIGO) sem resposta certa"
             sleep 20
           done
           echo "ok=$OK" >> "$GITHUB_OUTPUT"
@@ -117,7 +120,7 @@ jobs:
             '{from:"Energetic Seed <deploy@energeticseed.com>",
               to:["ferramentas@auramatrix.com.br"],
               subject:"The Sacred Prayer não está respondendo",
-              html:("<p>De fora do servidor, o The Sacred Prayer (o app em https://app.thesacredprayer.app ou a página de venda em https://thesacredprayer.app) <b>não respondeu</b> em 3 tentativas seguidas (página de venda: HTTP " + $c + ").</p>"
+              html:("<p>De fora do servidor, o The Sacred Prayer (o app em https://app.thesacredprayer.app, o banco de dados dele ou a página de venda em https://thesacredprayer.app) <b>não respondeu</b> em 3 tentativas seguidas (página de venda: HTTP " + $c + ").</p>"
                     + "<p>Está assim há pelo menos <b>" + $m + " minutos</b>.</p>"
                     + "<p>Como esta checagem roda no GitHub e não na VPS, isto costuma significar que o <b>servidor inteiro</b> está fora do ar, e não só o app.</p>"
                     + "<p style=\"color:#666;font-size:13px\">Verificação automática, de 10 em 10 minutos. Enquanto continuar fora do ar você recebe no máximo <b>um aviso por hora</b>, não um a cada checagem.</p>")}' \
