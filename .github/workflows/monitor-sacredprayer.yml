@@ -40,6 +40,16 @@ jobs:
         run: |
           set -uo pipefail
           OK=0
+          # PAUSA (K, 25/11/2026): a venda do The Sacred Prayer foi cancelada e o app foi desligado de proposito.
+          # Enquanto PAUSADO=on, este vigia nao confere nada e fica verde (o agendamento continua vivo, para o
+          # Escritorio nao achar que ele parou). RELIGAR: trocar para PAUSADO=off quando o app voltar.
+          PAUSADO=on
+          if [ "$PAUSADO" = "on" ]; then
+            echo "The Sacred Prayer pausado desde 25/11/2026: nada a conferir"
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "codigo=pausado" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Três tentativas espaçadas: um soluço de rede não vale um e-mail.
           # Confere o CONTEÚDO: durante a troca de containers o Traefik entrega
           # o /api/health pro site estático, que responde 200 com HTML. Olhar só
